@@ -1,0 +1,30 @@
+[project]
+name = "xr18-mcp"
+version = "0.1.1"
+description = "MCP server that lets an AI assistant run a Behringer XR18 mixer"
+authors = [
+    { name = "Pavel Lazarenko", email = "pavel.lazarenko@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=2.2.0",
+    "python-osc>=1.10.2",
+]
+
+[project.scripts]
+xr18-mcp = "xr18_mcp:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

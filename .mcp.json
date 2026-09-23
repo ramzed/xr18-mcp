@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "xr18": {
+      "command": "uv",
+      "args": ["run", "xr18-mcp"],
+      "env": {
+        "XR18_DATA_DIR": "."
+      }
+    }
+  }
+}

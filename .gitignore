@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/
+# automatic backups; named presets are kept in git
+presets/session-start-*.json
+presets/autosave-*.json
+dist/
