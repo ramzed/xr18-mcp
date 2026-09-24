@@ -1,5 +1,8 @@
 # XR18 MCP
 
+[![Tests](https://github.com/ramzed/xr18-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/ramzed/xr18-mcp/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 An MCP server that lets Claude work as a sound tech on a **Behringer XR18** during rehearsals.
 It connects over OSC/UDP and can run alongside X AIR Edit, which shows every change live.
 
@@ -54,8 +57,9 @@ Strips can be named by their mixer name ("Guitar", "click") or by id: `ch1-16`, 
   - muting more than 4 channels, or muting LR
   - loading presets or snapshots
   - system, routing and FX settings
-- **Undo.** Every change is read back from the mixer and written to `logs/changes.jsonl`. `undo` restores the exact
-  previous values.
+- **Checked writes.** Every change is read back from the mixer. Writes lost on the network (UDP) are sent again, and
+  anything that still didn't land is flagged in the reply.
+- **Undo.** Every change is written to `logs/changes.jsonl`. `undo` restores the exact previous values.
 - **Automatic backups.** When the server first connects, it saves the whole board as `presets/session-start-<time>.json`
   (the last 10 are kept). Loading a preset or snapshot first saves `presets/autosave-before-…`.
 - **Blocked.** `/-prefs` is never read or written. The mixer returns its network settings, **including Wi-Fi
@@ -68,8 +72,14 @@ Limits can be changed with environment variables in the app's MCP config: `XR18_
 ## Development
 
 ```
-uv run pytest          # unit tests and fake-mixer tests, no hardware needed
+uv sync
+uv run pytest --cov    # no hardware needed
 ```
+
+The tests run against `tests/fake_mixer.py`, an in-process UDP stand-in for the XR18. It answers reads, stores writes,
+renders `/node` text, streams meters, handles snapshot commands and can simulate lost packets. Every MCP tool is tested
+through the MCP layer, and coverage must stay at 95% or more. CI runs the suite on Linux, macOS and Windows with Python
+3.10 and 3.13.
 
 Layout: `osc_client.py` (UDP, matches each reply to its request, pipelined reads, meters) · `model.py` (address
 map, value conversions, name lookup) · `mixer.py` (connection, guarded writes, undo) · `safety.py` · `meters.py` ·
@@ -88,3 +98,7 @@ map, value conversions, name lookup) · `mixer.py` (connection, guarded writes, 
 Fader, frequency and dynamics curves come from
 [xair-api-python](https://github.com/onyx-and-iris/xair-api-python) (MIT). Its EQ Q curve and gate-mode order
 are corrected here.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

@@ -21,10 +21,18 @@ class MixerUnavailable(Exception):
 
 
 class Mixer:
-    def __init__(self, data_dir: Path, host: str | None = None, limits: Limits | None = None, port: int = XAIR_PORT):
+    def __init__(
+        self,
+        data_dir: Path,
+        host: str | None = None,
+        limits: Limits | None = None,
+        port: int = XAIR_PORT,
+        timeout: float = 0.3,
+    ):
         self.data_dir = data_dir
         self.host = host
         self.port = port
+        self.timeout = timeout
         self.limits = limits or Limits()
         self.client: OscClient | None = None
         self.info: MixerInfo | None = None
@@ -39,7 +47,7 @@ class Mixer:
     # ------------------------------------------------------------- connection
 
     async def _try(self, host: str) -> bool:
-        c = OscClient(host, self.port)
+        c = OscClient(host, self.port, timeout=self.timeout)
         try:
             await c.open()
             info = await c.info()
@@ -122,7 +130,7 @@ class Mixer:
         return out
 
     async def names(self, max_age: float = 2.0) -> dict[Strip, str]:
-        if time.monotonic() - self._names_at > max_age:
+        if time.monotonic() - self._names_at >= max_age:
             raw = await self.get_raw([s.addr("config/name") for s in ALL_STRIPS], strict=False)
             self._names = {s: (raw.get(s.addr("config/name")) or "") for s in ALL_STRIPS}
             self._names_at = time.monotonic()
@@ -148,6 +156,7 @@ class Mixer:
         """Guarded write: read old values, check guardrails, set, read back, journal."""
         if not changes:
             return None
+        changes = list({c.address: c for c in changes}.values())  # last value per address wins
         async with self._write_lock:
             addrs = [c.address for c in changes]
             old = await self.get_raw(addrs)
@@ -158,26 +167,68 @@ class Mixer:
             if reasons and not confirm:
                 preview = [Applied(c.address, c.label, old[c.address], c.new).line() for c in todo]
                 raise NeedsConfirmation(reasons, preview[:40] + ([f"... and {len(preview) - 40} more"] if len(preview) > 40 else []))
-            assert self.client
-            await self.client.set_many([(c.address, c.new) for c in todo])
-            new = await self.get_raw([c.address for c in todo]) if todo else {}
-            applied = [Applied(c.address, c.label, old[c.address], new.get(c.address, c.new)) for c in todo]
+            new = await self._write_verified([(c.address, c.new, old[c.address]) for c in todo])
+            applied = [
+                Applied(
+                    c.address, c.label, old[c.address], new.get(c.address, c.new),
+                    ok=not _dropped(new.get(c.address), c.new, old[c.address]),
+                )
+                for c in todo
+            ]
             if any(c.address.endswith("/config/name") for c in todo):
                 self._names_at = 0.0
             if not applied:
                 return Group(0, time.time(), tool, summary + " (no change needed)", [])
             return self.journal.record(tool, summary, applied)
 
-    async def undo(self, steps: int = 1) -> list[Group]:
+    async def _write_verified(self, writes: list[tuple[str, Any, Any]]) -> dict[str, Any]:
+        """Send (address, value, previous) writes, read them back and resend any that evidently
+        didn't land (UDP can drop packets in a burst). Returns the values read back."""
+        if not writes:
+            return {}
+        c = await self.ensure()
+        await c.set_many([(a, v) for a, v, _ in writes])
+        actual = await self.get_raw([a for a, _, _ in writes], strict=False)
+        for _ in range(WRITE_RETRIES):
+            missed = [(a, v, o) for a, v, o in writes if _dropped(actual.get(a), v, o)]
+            if not missed:
+                break
+            await c.set_many([(a, v) for a, v, _ in missed])
+            actual.update(await self.get_raw([a for a, _, _ in missed], strict=False))
+        return actual
+
+    async def undo(self, steps: int = 1) -> tuple[list[Group], list[str]]:
+        """Revert the last groups. Returns (reverted groups, labels of values that didn't land)."""
         groups = list(reversed(self.journal.undoable()))[:steps]
+        failed: list[str] = []
         async with self._write_lock:
             for g in groups:
-                await self.ensure()
-                assert self.client
-                await self.client.set_many([(c.address, c.old) for c in reversed(g.changes)])
+                writes = [(c.address, c.old, c.new) for c in reversed(g.changes)]
+                actual = await self._write_verified(writes)
+                failed += [c.label for c in g.changes if _dropped(actual.get(c.address), c.old, c.new)]
                 self.journal.mark_undone(g)
             self._names_at = 0.0
-        return groups
+        return groups, failed
+
+
+WRITE_RETRIES = 2
+# Normalized floats come back quantized (e.g. the HPF has 101 steps), so "took" allows about one step.
+WRITE_TOLERANCE = 0.011
+
+
+def _close(a: Any, b: Any, tol: float) -> bool:
+    if isinstance(a, float) and isinstance(b, (int, float)) and not isinstance(b, bool):
+        return abs(a - float(b)) <= tol
+    return a == b
+
+
+def _dropped(actual: Any, wanted: Any, previous: Any) -> bool:
+    """A write evidently didn't land: no read-back, or the mixer still reports the previous value."""
+    if actual is None:
+        return True
+    if _close(actual, wanted, WRITE_TOLERANCE):
+        return False
+    return _close(actual, previous, 1e-6)
 
 
 def _coerce(new: Any, old: Any) -> Any:

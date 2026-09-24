@@ -17,6 +17,7 @@ from pythonosc.osc_message import OscMessage
 from pythonosc.osc_message_builder import OscMessageBuilder
 
 XAIR_PORT = 10024
+METER_RENEW_SECONDS = 5.0  # meter subscriptions expire after about 10 s
 
 
 def build(address: str, *args: Any) -> bytes:
@@ -161,9 +162,10 @@ class OscClient:
             while (now := loop.time()) < end:
                 if now >= renew:
                     self.send("/meters", bank, *extra)
-                    renew = now + 5.0  # subscriptions last ~10 s
+                    renew = now + METER_RENEW_SECONDS
                 try:
-                    address, params = await asyncio.wait_for(q.get(), timeout=max(0.01, min(0.5, end - now)))
+                    wait = max(0.01, min(0.5, end - now, renew - now))
+                    address, params = await asyncio.wait_for(q.get(), timeout=wait)
                 except asyncio.TimeoutError:
                     continue
                 if address == bank and params and isinstance(params[0], (bytes, bytearray)):

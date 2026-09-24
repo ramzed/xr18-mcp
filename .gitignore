@@ -2,8 +2,10 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-logs/
-# automatic backups; named presets are kept in git
-presets/session-start-*.json
-presets/autosave-*.json
+.ruff_cache/
+.coverage
+htmlcov/
 dist/
+# your own board data: presets, backups and the change log stay local
+presets/
+logs/

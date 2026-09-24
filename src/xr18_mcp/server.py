@@ -21,6 +21,7 @@ from .mixer import Mixer, MixerUnavailable
 from .model import ALL_STRIPS, BOOL, COLORS, KINDS, ParamError, Strip
 from .safety import Change, Group, NeedsConfirmation, describe_raw
 
+
 def _default_data_dir() -> Path:
     # AI apps start the server from arbitrary working directories, so don't use cwd.
     # On macOS, ~/Documents is privacy-protected (writes from AI apps trigger a permission prompt).
@@ -33,6 +34,8 @@ DATA_DIR = Path(os.environ.get("XR18_DATA_DIR") or _default_data_dir())
 PRESETS_DIR = DATA_DIR / "presets"
 AUTOSAVE = os.environ.get("XR18_AUTOSAVE", "1") != "0"
 SESSION_PREFIX = "session-start-"
+MIN_METER_SECONDS = 0.5
+MIN_GAIN_CHECK_SECONDS = 2.0
 
 INSTRUCTIONS = """\
 Controls a Behringer XR18 digital mixer used for band rehearsals (live sound - changes are heard immediately).
@@ -82,6 +85,8 @@ def done(group: Group | None) -> str:
         return "Nothing changed - the mixer already had those values."
     lines = [f"Done (change #{group.id}; undo reverts it):"]
     lines += ["  " + c.line() for c in group.changes]
+    if not all(c.ok for c in group.changes):
+        lines.append("Some values did not reach the mixer (network packets lost). Check them and try again.")
     return "\n".join(lines)
 
 
@@ -592,7 +597,7 @@ async def read_meters(
     """Measure live levels for a few seconds (peak and average dBFS, 0 = clipping). scope 'channels' =
     channel strips, FX returns, buses, main LR; 'inputs' = raw mic/aux/USB inputs. Flags clipping, hot,
     low and silent signals."""
-    seconds = units.clamp(seconds, 0.5, 30)
+    seconds = units.clamp(seconds, MIN_METER_SECONDS, 30)
     c = await mixer.ensure()
     bank, layout = mtr.BANKS[scope]
     frames = await c.sample_meters(bank, seconds)
@@ -618,7 +623,7 @@ async def gain_check(targets: list[str] | None = None, seconds: float = 8.0, tar
     """Gain-staging helper. Ask the musicians to play their LOUDEST part first, then run this. Measures
     channel peaks and suggests preamp gain changes to reach target_peak_db (default -12 dBFS). Suggests
     only - apply with set_preamp."""
-    seconds = units.clamp(seconds, 2, 30)
+    seconds = units.clamp(seconds, MIN_GAIN_CHECK_SECONDS, 30)
     c = await mixer.ensure()
     names = await mixer.names()
     chans = [await mixer.resolve(t, ("ch",)) for t in targets] if targets else [s for s in ALL_STRIPS if s.kind == "ch"]
@@ -767,19 +772,25 @@ async def snapshot_load(slot: int, confirm: bool = False) -> str:
     backup = f"autosave-before-snapshot-{slot}-{time.strftime('%Y%m%d-%H%M%S')}"
     await _save_preset(backup, f"Automatic backup before loading snapshot {slot} '{nm}'")
     c.send("/-snap/load", slot)
+    index = (await mixer.get_raw(["/-snap/index"]))["/-snap/index"]
+    if index != slot:
+        return (f"Sent the load for snapshot {slot} '{nm}', but the mixer reports snapshot {index} as current - "
+                f"check in X AIR Edit. Previous board saved as preset '{backup}'.")
     return f"Loaded snapshot {slot} '{nm}'. Previous board saved as preset '{backup}'."
 
 
 @tool(RW)
 async def undo(steps: int = 1) -> str:
     """Revert the last change group(s) made through this assistant (restores the exact previous values)."""
-    groups = await mixer.undo(max(1, steps))
+    groups, failed = await mixer.undo(max(1, steps))
     if not groups:
         return "Nothing to undo."
     out = []
     for g in groups:
         out.append(f"Reverted change #{g.id} ({g.summary}):")
         out += [f"  {c.label}: back to {describe_raw(c.address, c.old)}" for c in g.changes]
+    if failed:
+        out.append(f"These did not reach the mixer (network packets lost), check them: {', '.join(failed)}")
     return "\n".join(out)
 
 

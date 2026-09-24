@@ -59,9 +59,11 @@ class Applied:
     label: str
     old: Any
     new: Any
+    ok: bool = True  # False when the read-back shows the write never landed
 
     def line(self) -> str:
-        return f"{self.label}: {describe_raw(self.address, self.old)} -> {describe_raw(self.address, self.new)}"
+        text = f"{self.label}: {describe_raw(self.address, self.old)} -> {describe_raw(self.address, self.new)}"
+        return text if self.ok else text + "  [NOT APPLIED - the mixer still reports the old value]"
 
 
 def describe_raw(address: str, raw: Any) -> str:
@@ -155,7 +157,9 @@ class Journal:
             "ts": g.ts,
             "tool": g.tool,
             "summary": g.summary,
-            "changes": [{"address": c.address, "label": c.label, "old": c.old, "new": c.new} for c in g.changes],
+            "changes": [
+                {"address": c.address, "label": c.label, "old": c.old, "new": c.new, "ok": c.ok} for c in g.changes
+            ],
         }
 
     def _write(self, rec: dict[str, Any]) -> None:
