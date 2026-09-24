@@ -38,6 +38,7 @@ async def test_falls_back_to_discovery(fake, tmp_path, monkeypatch):
 
 async def test_no_mixer_anywhere(tmp_path, monkeypatch):
     monkeypatch.setattr(mixer_mod, "discover", list)
+    monkeypatch.setattr(mixer_mod.sys, "platform", "linux")
     m = Mixer(tmp_path, host="192.0.2.1", port=9, timeout=0.02)
     with pytest.raises(MixerUnavailable, match="at 192.0.2.1") as e:
         await m.ensure()
