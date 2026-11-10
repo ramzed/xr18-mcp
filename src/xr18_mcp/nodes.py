@@ -1,4 +1,4 @@
-"""Parse the XR18's /node text replies.
+"""Parse the mixer's /node text replies.
 
 A /node request returns one line per node, e.g.
     /ch/01/config "Guitar" 2 In01 U01
@@ -34,8 +34,5 @@ def named(path: str, values: list[str], params: tuple[str, ...]) -> dict[str, st
     return {p: v for p, v in zip(params, values)}
 
 
-def layout_of(path: str) -> tuple[str, ...] | None:
-    return _LAYOUT.get(path)
-
-
-_LAYOUT: dict[str, tuple[str, ...]] = {p: params for p, params in model.all_nodes()}
+def layout_of(path: str, profile: model.Profile = model.XAIR) -> tuple[str, ...] | None:
+    return profile.layouts.get(path)

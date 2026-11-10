@@ -142,7 +142,7 @@ def test_strip_ids_bases_titles():
     }
     for s, (sid, base, title) in expect.items():
         assert (s.id, s.base, s.title) == (sid, base, title)
-    assert len(model.ALL_STRIPS) == 16 + 1 + 4 + 6 + 4 + 1 + 4
+    assert len(model.XAIR.all_strips) == 16 + 1 + 4 + 6 + 4 + 1 + 4
     assert Strip("ch", 1).eq_bands == 4 and Strip("lr").eq_bands == 6 and Strip("dca", 1).eq_bands == 0
     assert Strip("aux").sends_from and not Strip("bus", 1).sends_from
     assert Strip("dca", 1).addr("") == "/dca/1"
@@ -156,20 +156,20 @@ def test_node_layouts():
     assert dict(Strip("dca", 2).nodes())["dca/2"] == ("on", "fader")
     assert dict(Strip("fxsend", 1).nodes())["fxsend/1/mix"] == ("on", "fader")
     with pytest.raises(KeyError):
-        model._layout("nope")
+        model.XAIR.layout("nope")
 
 
 def test_send_suffix():
-    assert model.send_suffix(Strip("bus", 2)) == "mix/02"
-    assert model.send_suffix(Strip("fxsend", 1)) == "mix/07"
+    assert model.XAIR.send_suffix(Strip("bus", 2)) == "mix/02"
+    assert model.XAIR.send_suffix(Strip("fxsend", 1)) == "mix/07"
     with pytest.raises(ParamError):
-        model.send_suffix(Strip("lr"))
+        model.XAIR.send_suffix(Strip("lr"))
 
 
 def test_leaf_map():
-    assert len(model.LEAF_KINDS) == 2898
-    assert not any(a.startswith(("/-prefs", "/-snap", "/-action", "/-stat")) for a in model.LEAF_KINDS)
-    kind = model.kind_of
+    assert len(model.XAIR.leaf_kinds) == 2898
+    assert not any(a.startswith(("/-prefs", "/-snap", "/-action", "/-stat")) for a in model.XAIR.leaf_kinds)
+    kind = model.XAIR.kind_of
     assert isinstance(kind("/ch/16/mix/03/level"), model.Fader)
     assert kind("/ch/01/mix/02/pan") is None  # even bus sends have no pan
     assert isinstance(kind("/headamp/01/gain"), model.Lin)
@@ -184,10 +184,10 @@ def test_leaf_map():
 
 
 def test_strip_of():
-    assert model.strip_of("/ch/03/mix/fader") == Strip("ch", 3)
-    assert model.strip_of("/rtn/aux/mix/on") == Strip("aux")
-    assert model.strip_of("/dca/2") == Strip("dca", 2)
-    assert model.strip_of("/headamp/01/gain") is None
+    assert model.XAIR.strip_of("/ch/03/mix/fader") == Strip("ch", 3)
+    assert model.XAIR.strip_of("/rtn/aux/mix/on") == Strip("aux")
+    assert model.XAIR.strip_of("/dca/2") == Strip("dca", 2)
+    assert model.XAIR.strip_of("/headamp/01/gain") is None
 
 
 # ------------------------------------------------------------ name lookup
@@ -210,24 +210,24 @@ NAMES = {
     ],
 )
 def test_resolve(text, expected):
-    assert model.resolve(text, NAMES) == expected
+    assert model.XAIR.resolve(text, NAMES) == expected
 
 
 def test_resolve_fx_meaning_and_errors():
-    assert model.resolve("fx1", NAMES, fx_means="fxsend") == Strip("fxsend", 1)
+    assert model.XAIR.resolve("fx1", NAMES, fx_means="fxsend") == Strip("fxsend", 1)
     with pytest.raises(ParamError, match="ambiguous"):
-        model.resolve("vox", NAMES)
+        model.XAIR.resolve("vox", NAMES)
     with pytest.raises(ParamError, match="No channel"):
-        model.resolve("drums", NAMES)
+        model.XAIR.resolve("drums", NAMES)
     with pytest.raises(ParamError, match="does not exist"):
-        model.resolve("ch17", NAMES)
+        model.XAIR.resolve("ch17", NAMES)
     with pytest.raises(ParamError, match="does not exist"):
-        model.resolve("bus7", NAMES)
+        model.XAIR.resolve("bus7", NAMES)
     with pytest.raises(ParamError, match="can't be used"):
-        model.resolve("lr", NAMES, allowed=("ch",))
+        model.XAIR.resolve("lr", NAMES, allowed=("ch",))
     # names of disallowed kinds are ignored
     with pytest.raises(ParamError, match="No channel"):
-        model.resolve("pavel iem", NAMES, allowed=("ch",))
+        model.XAIR.resolve("pavel iem", NAMES, allowed=("ch",))
 
 
 def test_label():
@@ -254,14 +254,14 @@ CH3 = Strip("ch", 3)
     ],
 )
 def test_friendly_addresses(strip, key, address):
-    assert model.friendly_address(strip, key)[0] == address
+    assert model.XAIR.friendly_address(strip, key)[0] == address
 
 
 def test_friendly_send_addresses():
-    assert model.friendly_address(CH3, "send.level", Strip("bus", 2))[0] == "/ch/03/mix/02/level"
-    assert model.friendly_address(CH3, "send.tap", Strip("bus", 2))[0] == "/ch/03/mix/02/tap"
-    assert model.friendly_address(CH3, "send.pan", Strip("bus", 3))[0] == "/ch/03/mix/03/pan"
-    assert model.friendly_address(Strip("fxrtn", 1), "send.level", Strip("fxsend", 1))[0] == "/rtn/1/mix/07/level"
+    assert model.XAIR.friendly_address(CH3, "send.level", Strip("bus", 2))[0] == "/ch/03/mix/02/level"
+    assert model.XAIR.friendly_address(CH3, "send.tap", Strip("bus", 2))[0] == "/ch/03/mix/02/tap"
+    assert model.XAIR.friendly_address(CH3, "send.pan", Strip("bus", 3))[0] == "/ch/03/mix/03/pan"
+    assert model.XAIR.friendly_address(Strip("fxrtn", 1), "send.level", Strip("fxsend", 1))[0] == "/rtn/1/mix/07/level"
 
 
 @pytest.mark.parametrize(
@@ -288,8 +288,8 @@ def test_friendly_send_addresses():
 )
 def test_friendly_errors(strip, key, dest, match):
     with pytest.raises(ParamError, match=match):
-        model.friendly_address(strip, key, dest)
+        model.XAIR.friendly_address(strip, key, dest)
 
 
 def test_hpf_conversion_is_finite():
-    assert not math.isnan(model.friendly_address(CH3, "hpf")[1].to_raw(100))
+    assert not math.isnan(model.XAIR.friendly_address(CH3, "hpf")[1].to_raw(100))

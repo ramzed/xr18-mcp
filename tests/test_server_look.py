@@ -136,7 +136,7 @@ async def test_no_mixer_is_a_tool_error(rig, monkeypatch):
 
     monkeypatch.setattr(mixer_mod, "discover", list)
     rig.fake.answer_xinfo = False
-    await rig.fails("mixer_status", "No XR18 answered")
+    await rig.fails("mixer_status", "No mixer answered")
 
 
 def test_entry_points(monkeypatch):

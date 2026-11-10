@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from . import model, nodes
-from .model import ALL_STRIPS, Strip
-from .osc_client import XAIR_PORT, MixerInfo, OscClient, discover
+from .model import Strip
+from .osc_client import X32_PORT, XAIR_PORT, MixerInfo, OscClient, discover
 from .safety import Applied, Change, Group, Journal, Limits, NeedsConfirmation, check
 
 
@@ -26,7 +26,7 @@ class Mixer:
         data_dir: Path,
         host: str | None = None,
         limits: Limits | None = None,
-        port: int = XAIR_PORT,
+        port: int | None = None,
         timeout: float = 0.3,
     ):
         self.data_dir = data_dir
@@ -36,6 +36,7 @@ class Mixer:
         self.limits = limits or Limits()
         self.client: OscClient | None = None
         self.info: MixerInfo | None = None
+        self.profile: model.Profile = model.XAIR  # replaced by the connected mixer's profile
         self.journal = Journal(data_dir / "logs" / "changes.jsonl")
         self.on_first_connect: Callable[[Mixer], Awaitable[None]] | None = None
         self._connected_once = False
@@ -46,29 +47,37 @@ class Mixer:
 
     # ------------------------------------------------------------- connection
 
-    async def _try(self, host: str) -> bool:
-        c = OscClient(host, self.port, timeout=self.timeout)
-        try:
-            await c.open()
-            info = await c.info()
-        except OSError:  # e.g. "no route to host" when macOS blocks local network access
+    async def _try(self, host: str, ports: tuple[int, ...]) -> bool:
+        for port in ports:
+            c = OscClient(host, port, timeout=self.timeout)
+            try:
+                await c.open()
+                info = await c.info()
+            except OSError:  # e.g. "no route to host" when macOS blocks local network access
+                c.close()
+                continue
+            if info:
+                self.client, self.info = c, info
+                self.profile = model.for_model(info.model)
+                self._names_at = 0.0
+                return True
             c.close()
-            return False
-        if info:
-            self.client, self.info = c, info
-            return True
-        c.close()
         return False
+
+    def _ports(self, found: int = 0) -> tuple[int, ...]:
+        if self.port:
+            return (self.port,)
+        return (found,) if found else (XAIR_PORT, X32_PORT)
 
     async def ensure(self) -> OscClient:
         first = False
         async with self._lock:
             if self.client is None:
-                ok = bool(self.host) and await self._try(self.host)
+                ok = bool(self.host) and await self._try(self.host, self._ports())
                 if not ok:
                     found = await asyncio.to_thread(discover)
                     for m in found:
-                        if await self._try(m.ip):
+                        if await self._try(m.ip, self._ports(m.port)):
                             ok = True
                             break
                 if not ok:
@@ -80,7 +89,7 @@ class Mixer:
                         else ""
                     )
                     raise MixerUnavailable(
-                        f"No XR18 answered {where}and none was found by network discovery. "
+                        f"No mixer answered {where}and none was found by network discovery. "
                         "Check the mixer is on and this computer is on the same network." + hint
                     )
                 first = not self._connected_once
@@ -110,7 +119,7 @@ class Mixer:
             raise await self._fail(f"no reply for {missing[0]}")
         if strict and missing:
             raise model.ParamError(
-                f"The mixer does not answer for {', '.join(missing[:5])} - not a valid XR18 address?"
+                f"The mixer does not answer for {', '.join(missing[:5])} - not a valid {self.profile.family} address?"
             )
         return out
 
@@ -125,30 +134,40 @@ class Mixer:
             if not text:
                 continue
             for path, values in nodes.parse_lines(text).items():
-                layout = nodes.layout_of(path)
+                layout = nodes.layout_of(path, self.profile)
                 out[path] = nodes.named(path, values, layout) if layout else {str(i): v for i, v in enumerate(values)}
         return out
 
     async def names(self, max_age: float = 2.0) -> dict[Strip, str]:
+        await self.ensure()  # the strip list depends on which mixer answers
         if time.monotonic() - self._names_at >= max_age:
-            raw = await self.get_raw([s.addr("config/name") for s in ALL_STRIPS], strict=False)
-            self._names = {s: (raw.get(s.addr("config/name")) or "") for s in ALL_STRIPS}
+            strips = self.profile.all_strips
+            raw = await self.get_raw([s.addr("config/name") for s in strips], strict=False)
+            self._names = {s: (raw.get(s.addr("config/name")) or "") for s in strips}
             self._names_at = time.monotonic()
         return self._names
 
     async def resolve(self, text: str, allowed: tuple[str, ...] | None = None, fx_means: str = "fxrtn") -> Strip:
-        return model.resolve(text, await self.names(), allowed, fx_means)
+        return self.profile.resolve(text, await self.names(), allowed, fx_means)
 
     async def label(self, s: Strip) -> str:
         return model.label(s, await self.names())
+
+    async def sources(self, strips: list[Strip]) -> dict[str, Any]:
+        """Typed values plus /node text ("text:/<node>/<param>") the profile needs to trace input sources."""
+        await self.ensure()
+        p = self.profile
+        raw = await self.get_raw(list(dict.fromkeys(a for s in strips for a in p.source_reads(s))), strict=False)
+        if p.source_nodes and any(s.kind == "ch" for s in strips):
+            for path, vals in (await self.read_nodes(list(p.source_nodes))).items():
+                raw.update({f"text:/{path}/{k}": v for k, v in vals.items()})
+        return raw
 
     async def headamp_for(self, s: Strip) -> int | None:
         """Mic preamp number feeding a channel (follows the channel's input source)."""
         if s.kind != "ch":
             return None
-        raw = await self.get_raw([s.addr("config/insrc")])
-        src = raw[s.addr("config/insrc")]
-        return src + 1 if isinstance(src, int) and 0 <= src < 16 else None
+        return self.profile.headamp_of(s, await self.sources([s]))
 
     # ----------------------------------------------------------------- writes
 
@@ -162,16 +181,17 @@ class Mixer:
             old = await self.get_raw(addrs)
             for c in changes:
                 c.new = _coerce(c.new, old[c.address])
-            reasons = check([(c, old[c.address]) for c in changes], self.limits)
+            reasons = check([(c, old[c.address]) for c in changes], self.limits, self.profile)
             todo = [c for c in changes if not _same(old[c.address], c.new)]
             if reasons and not confirm:
-                preview = [Applied(c.address, c.label, old[c.address], c.new).line() for c in todo]
+                preview = [Applied(c.address, c.label, old[c.address], c.new, profile=self.profile).line() for c in todo]
                 raise NeedsConfirmation(reasons, preview[:40] + ([f"... and {len(preview) - 40} more"] if len(preview) > 40 else []))
             new = await self._write_verified([(c.address, c.new, old[c.address]) for c in todo])
             applied = [
                 Applied(
                     c.address, c.label, old[c.address], new.get(c.address, c.new),
                     ok=not _dropped(new.get(c.address), c.new, old[c.address]),
+                    profile=self.profile,
                 )
                 for c in todo
             ]

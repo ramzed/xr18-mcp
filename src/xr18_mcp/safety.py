@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,17 +59,19 @@ class Applied:
     old: Any
     new: Any
     ok: bool = True  # False when the read-back shows the write never landed
+    profile: model.Profile = field(default=model.XAIR, repr=False, compare=False)
 
     def line(self) -> str:
-        text = f"{self.label}: {describe_raw(self.address, self.old)} -> {describe_raw(self.address, self.new)}"
+        old, new = describe_raw(self.address, self.old, self.profile), describe_raw(self.address, self.new, self.profile)
+        text = f"{self.label}: {old} -> {new}"
         return text if self.ok else text + "  [NOT APPLIED - the mixer still reports the old value]"
 
 
-def describe_raw(address: str, raw: Any) -> str:
-    kind = model.kind_of(address)
+def describe_raw(address: str, raw: Any, profile: model.Profile = model.XAIR) -> str:
+    kind = profile.kind_of(address)
     if raw is None:
         return "?"
-    if address.endswith("/mix/on") or re.fullmatch(r"/dca/\d/on", address):
+    if profile.is_mute_switch(address):
         return "on" if raw else "MUTED"
     if kind is None or isinstance(kind, model.Opaque):
         return repr(raw)
@@ -80,38 +81,34 @@ def describe_raw(address: str, raw: Any) -> str:
         return repr(raw)
 
 
-def _is_level(address: str) -> bool:
-    return isinstance(model.kind_of(address), model.Fader)
-
-
-def check(pairs: list[tuple[Change, Any]], limits: Limits) -> list[str]:
+def check(pairs: list[tuple[Change, Any]], limits: Limits, profile: model.Profile = model.XAIR) -> list[str]:
     """Return the reasons a batch of changes needs explicit confirmation."""
     reasons: list[str] = []
     mutes = []
     for ch, old in pairs:
         a = ch.address
-        if any(a.startswith(p) for p in model.BLOCKED_PREFIXES):
+        if any(a.startswith(p) for p in profile.blocked_prefixes):
             raise model.ParamError(f"{a} is blocked (network settings and credentials are never touched)")
         if old == ch.new:
             continue
-        if _is_level(a) and isinstance(old, float) and isinstance(ch.new, float):
+        if isinstance(profile.kind_of(a), model.Fader) and isinstance(old, float) and isinstance(ch.new, float):
             o, n = units.fader_to_db(old), units.fader_to_db(ch.new)
             if n > o + limits.max_raise_db and n > limits.loud_db:
                 reasons.append(f"{ch.label} jumps up from {units.fmt_db(o)} to {units.fmt_db(n)} dB")
-            if a == "/lr/mix/fader" and n > limits.lr_max_db and n > o:
+            if a in profile.main_fader_addrs and n > limits.lr_max_db and n > o:
                 reasons.append(f"main LR goes above {units.fmt_db(limits.lr_max_db)} dB (to {units.fmt_db(n)} dB)")
         elif a.endswith("/phantom"):
             reasons.append(f"{ch.label}: phantom power {'ON' if ch.new else 'OFF'} (48 V can damage ribbon mics and causes loud pops)")
         elif a.startswith("/headamp/") and a.endswith("/gain") and isinstance(old, float):
-            kind = model.KINDS["headamp/gain"]
+            kind = profile.kinds["headamp/gain"]
             o, n = kind.from_raw(old), kind.from_raw(ch.new)
             if n - o > limits.max_gain_jump_db:
                 reasons.append(f"{ch.label} jumps from {o:+.1f} to {n:+.1f} dB")
-        elif (a.endswith("/mix/on") or re.fullmatch(r"/dca/\d/on", a)) and old == 1 and ch.new == 0:
+        elif profile.is_mute_switch(a) and old == 1 and ch.new == 0:
             mutes.append(ch.label)
-            if a == "/lr/mix/on":
+            if a in profile.main_on_addrs:
                 reasons.append("mutes the main LR output")
-        elif any(a.startswith(p) for p in model.CONFIRM_PREFIXES):
+        elif any(a.startswith(p) for p in profile.confirm_prefixes):
             reasons.append(f"changes system setting {a}")
     if len(mutes) > limits.max_mutes:
         reasons.append(f"mutes {len(mutes)} channels at once ({', '.join(mutes)})")

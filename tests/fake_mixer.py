@@ -1,4 +1,4 @@
-"""An in-process UDP stand-in for the XR18, so tests run without hardware.
+"""An in-process UDP stand-in for an XR18 (or an X32), so tests run without hardware.
 
 It answers typed reads, stores typed writes, renders /node text like the real mixer,
 streams meter blobs on /meters subscriptions, handles snapshot commands, and can
@@ -18,12 +18,18 @@ from xr18_mcp import model
 from xr18_mcp.osc_client import build
 
 FX_TYPES = ("HALL", "PLAT", "VRM", "DLY")
+# X32 /config/routing/IN block values as console text (the server reads only the text)
+X32_IN_ROUTING = (
+    *[f"AN{i}-{i + 7}" for i in range(1, 32, 8)],
+    *[f"{box}{i}-{i + 7}" for box in "AB" for i in range(1, 48, 8)],
+    *[f"CARD{i}-{i + 7}" for i in range(1, 32, 8)],
+)
 
 
-def default_values() -> dict[str, Any]:
+def default_values(profile: model.Profile = model.XAIR) -> dict[str, Any]:
     """A plausible idle board: inputs at -inf, outputs at 0 dB, nothing sent anywhere."""
     vals: dict[str, Any] = {}
-    for addr, kind in model.LEAF_KINDS.items():
+    for addr, kind in profile.leaf_kinds.items():
         if isinstance(kind, model.Str):
             vals[addr] = ""
         elif isinstance(kind, model.Fader):
@@ -32,11 +38,26 @@ def default_values() -> dict[str, Any]:
             vals[addr] = 0.5
         else:
             vals[addr] = 0
-    for s in model.ALL_STRIPS:
+    for s in profile.all_strips:
         on = s.addr("on") if s.kind == "dca" else s.addr("mix/on")
         vals[on] = 1
-        if s.kind in ("bus", "fxsend", "lr", "dca", "fxrtn"):
+        if s.kind in ("bus", "fxsend", "lr", "dca", "fxrtn", "mtx", "mono"):
             vals[s.addr("fader") if s.kind == "dca" else s.addr("mix/fader")] = 0.75
+    if profile is model.X32:
+        for s in profile.strips("ch"):
+            vals[s.addr("config/source")] = s.index
+            vals[s.addr("mix/st")] = 1
+            for d in profile.send_dests:
+                vals[s.addr(profile.send_leaf(d, "on"))] = 1
+        for s in profile.strips("aux"):
+            vals[s.addr("config/source")] = 32 + s.index  # Aux1-6, then USB L/R
+        for n in range(128):
+            vals[profile.headamp_addr(n, "gain")] = model.KINDS["headamp/gain"].to_raw(0)
+        vals["/-show/prepos/current"] = 0
+        for i in profile.snap_slots:
+            vals[profile.snap_name_addr(i)] = ""
+            vals[f"/-show/showfile/scene/{i:03d}/hasdata"] = 0
+        return vals
     for i in range(1, 17):
         vals[f"/ch/{i:02d}/config/insrc"] = i - 1
         vals[f"/ch/{i:02d}/config/rtnsrc"] = i - 1
@@ -49,17 +70,19 @@ def default_values() -> dict[str, Any]:
     return vals
 
 
-def text_value(addr: str, v: Any) -> str:
-    """Render a raw value the way the XR18's /node text does (enough for the server's parsing)."""
+def text_value(addr: str, v: Any, profile: model.Profile = model.XAIR) -> str:
+    """Render a raw value the way the mixer's /node text does (enough for the server's parsing)."""
     if isinstance(v, str):
         return f'"{v}"'
     if addr.endswith("/config/insrc"):
         return f"In{v + 1:02d}" if v < 16 else f"Aux{v}"
     if addr.endswith("/config/rtnsrc"):
         return f"U{v + 1:02d}"
+    if addr.startswith("/config/routing/IN/") and isinstance(v, int) and v < len(X32_IN_ROUTING):
+        return X32_IN_ROUTING[v]
     if re.fullmatch(r"/fx/\d/type", addr):
         return FX_TYPES[v % len(FX_TYPES)]
-    kind = model.kind_of(addr)
+    kind = profile.kind_of(addr)
     if isinstance(kind, model.Fader):
         db = kind.from_raw(v)
         return "-oo" if db == float("-inf") else f"{db:+.1f}"
@@ -72,6 +95,12 @@ def meter_blob(levels_db: list[float]) -> bytes:
     return struct.pack("<i", len(levels_db)) + struct.pack(f"<{len(levels_db)}h", *(int(v * 256) for v in levels_db))
 
 
+def meter_blob_float(levels_db: list[float]) -> bytes:
+    """X32 meters: linear floats, 1.0 = 0 dBFS."""
+    lin = [10 ** (v / 20) if v > -128 else 0.0 for v in levels_db]
+    return struct.pack("<i", len(lin)) + struct.pack(f"<{len(lin)}f", *lin)
+
+
 class FakeMixer(asyncio.DatagramProtocol):
     def __init__(
         self,
@@ -80,8 +109,10 @@ class FakeMixer(asyncio.DatagramProtocol):
         drop_sets: dict[str, int] | None = None,
         meters: dict[str, list[float]] | None = None,
         answer_xinfo: bool = True,
+        profile: model.Profile = model.XAIR,
     ):
-        self.values = values if values is not None else default_values()
+        self.profile = profile
+        self.values = values if values is not None else default_values(profile)
         self.drop_first = set(drop_first or ())  # first read of these addresses is "lost"
         self.drop_sets = dict(drop_sets or {})  # address -> how many writes to "lose"
         self.meters = meters or {}  # bank -> dB values streamed on subscription
@@ -90,6 +121,7 @@ class FakeMixer(asyncio.DatagramProtocol):
         self.sets: list[tuple[str, Any]] = []
         self.subscriptions: list[str] = []
         self.snap_loads: list[int] = []
+        self.meter_args: list[tuple[Any, ...]] = []  # arguments of /meters and /save requests
         self.hide_nodes: set[str] = set()  # /node paths that never answer
         self.transport: asyncio.DatagramTransport | None = None
         self.port = 0
@@ -108,10 +140,14 @@ class FakeMixer(asyncio.DatagramProtocol):
             return
         if a == "/xinfo":
             if self.answer_xinfo:
-                self.reply(addr, "/xinfo", "127.0.0.1", "FAKE-XR18", "XR18", "1.25")
+                if self.profile is model.X32:
+                    self.reply(addr, "/xinfo", "127.0.0.1", "FAKE-X32", "X32C", "4.06")
+                else:
+                    self.reply(addr, "/xinfo", "127.0.0.1", "FAKE-XR18", "XR18", "1.25")
         elif a == "/node":
             self._node(addr, p[0])
         elif a == "/meters":
+            self.meter_args.append(tuple(p))
             self._subscribe(addr, p[0])
         elif a == "/-snap/save":
             self.values[f"/-snap/{p[0]:02d}/name"] = self.values.get("/-snap/name", "")
@@ -119,6 +155,14 @@ class FakeMixer(asyncio.DatagramProtocol):
         elif a == "/-snap/load":
             self.snap_loads.append(p[0])
             self.values["/-snap/index"] = p[0]
+        elif a == "/save" and p and p[0] == "scene":
+            self.meter_args.append(tuple(p))
+            self.values[self.profile.snap_name_addr(p[1])] = p[2]
+            self.values[f"/-show/showfile/scene/{p[1]:03d}/hasdata"] = 1
+            self.values["/-show/prepos/current"] = p[1]
+        elif a == "/-action/goscene":
+            self.snap_loads.append(p[0])
+            self.values["/-show/prepos/current"] = p[0]
         elif p:
             if self.drop_sets.get(a):
                 self.drop_sets[a] -= 1
@@ -131,12 +175,14 @@ class FakeMixer(asyncio.DatagramProtocol):
     def _node(self, addr, path: str) -> None:
         if path in self.hide_nodes:
             return
-        layout = dict(model.all_nodes()).get(path)
+        layout = self.profile.layouts.get(path)
         if layout is not None:
-            vals = " ".join(text_value(model.leaf(path, prm), self.values.get(model.leaf(path, prm), 0)) for prm in layout)
+            vals = " ".join(
+                text_value(model.leaf(path, prm), self.values.get(model.leaf(path, prm), 0), self.profile) for prm in layout
+            )
             self.reply(addr, "node", f"/{path} {vals}\n")
         elif "/" + path in self.values:
-            self.reply(addr, "node", f"/{path} {text_value('/' + path, self.values['/' + path])}\n")
+            self.reply(addr, "node", f"/{path} {text_value('/' + path, self.values['/' + path], self.profile)}\n")
 
     def _subscribe(self, addr, bank: str) -> None:
         self.subscriptions.append(bank)
@@ -144,8 +190,9 @@ class FakeMixer(asyncio.DatagramProtocol):
         if not levels:
             return
         loop = asyncio.get_running_loop()
+        blob = meter_blob_float(levels) if self.profile is model.X32 else meter_blob(levels)
         for i in range(self.meter_frames):
-            loop.call_later(0.005 * i, self.reply, addr, bank, meter_blob(levels))
+            loop.call_later(0.005 * i, self.reply, addr, bank, blob)
 
 
 async def start(**kw) -> tuple[FakeMixer, asyncio.DatagramTransport]:

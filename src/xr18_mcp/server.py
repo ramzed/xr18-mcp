@@ -1,4 +1,4 @@
-"""MCP server exposing the Behringer XR18 to an AI assistant."""
+"""MCP server exposing a Behringer XR18 (or, experimentally, an X32/M32) to an AI assistant."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from . import meters as mtr
 from . import model, presets, units
 from .mixer import Mixer, MixerUnavailable
-from .model import ALL_STRIPS, BOOL, COLORS, KINDS, ParamError, Strip
+from .model import BOOL, COLORS, ParamError, Profile, Strip
 from .safety import Change, Group, NeedsConfirmation, describe_raw
 
 
@@ -38,11 +38,13 @@ MIN_METER_SECONDS = 0.5
 MIN_GAIN_CHECK_SECONDS = 2.0
 
 INSTRUCTIONS = """\
-Controls a Behringer XR18 digital mixer used for band rehearsals (live sound - changes are heard immediately).
+Controls a Behringer XR18 digital mixer (X32/M32 consoles: experimental) used for band rehearsals
+(live sound - changes are heard immediately).
 
-- Start with board_overview to learn channel names and levels. Refer to strips by name ("Guitar", "click")
-  or id: ch1-ch16, aux, fxrtn1-4, bus1-6, fxsend1-4, lr (main), dca1-4.
-- Levels are dB (faders and sends: -inf..+10). Monitor/in-ear mixes are sends from channels to buses 1-6,
+- Start with board_overview to learn the model, channel names and levels. Refer to strips by name ("Guitar",
+  "click") or id. XR18: ch1-16, aux, fxrtn1-4, bus1-6, fxsend1-4, lr (main), dca1-4.
+  X32/M32: ch1-32, aux1-8, fxrtn1-8, bus1-16, mtx1-6, lr, mono, dca1-8.
+- Levels are dB (faders and sends: -inf..+10). Monitor/in-ear mixes are sends from channels to buses,
   normally with tap PRE (pre-fader). "More X in the singer's ears" = raise the send from X to the singer's bus.
 - Prefer small steps (2-3 dB) and relative changes. Use read_meters / gain_check before touching preamp gain.
 - Guardrails: risky actions (phantom power, big level jumps, muting many channels, main LR above 0 dB,
@@ -50,7 +52,7 @@ Controls a Behringer XR18 digital mixer used for band rehearsals (live sound - c
   then repeat the call with confirm=true. Never pass confirm=true without the user's explicit OK.
 - Every change is journaled: undo reverts the last change group. The board as it was when this session first
   connected is saved as preset session-start-<time>; load_preset can restore it.
-- X AIR Edit or other apps may change the board at the same time; re-read before reasoning about old values.
+- X AIR Edit, X32-Edit or other apps may change the board at the same time; re-read before reasoning about old values.
 """
 
 mcp = MCPServer("xr18", instructions=INSTRUCTIONS)
@@ -93,11 +95,18 @@ def done(group: Group | None) -> str:
 # ------------------------------------------------------------------ helpers
 
 
+async def _profile() -> Profile:
+    """Connect if needed and return the connected mixer's profile."""
+    await mixer.ensure()
+    return mixer.profile
+
+
 async def _save_preset(name: str, notes: str) -> tuple[Path, int, int]:
-    raw = await mixer.get_raw(presets.ALL_LEAVES, strict=False)
+    p = await _profile()
+    raw = await mixer.get_raw(p.leaves, strict=False)
     values = {a: v for a, v in raw.items() if v is not None}
     info = mixer.info.__dict__ if mixer.info else None
-    path = presets.write(PRESETS_DIR, name, notes, values, info)
+    path = presets.write(PRESETS_DIR, name, notes, values, info, p)
     return path, len(values), len(raw) - len(values)
 
 
@@ -119,19 +128,20 @@ async def _change(
 ) -> Change:
     """Build a guarded change from a friendly parameter name."""
     names = await mixer.names()
+    p = mixer.profile
     lbl = model.label(s, names)
     k = key.strip().lower()
     if k == "mute":
-        addr, _ = model.friendly_address(s, "on")
+        addr, _ = p.friendly_address(s, "on")
         return Change(addr, 0 if BOOL.to_raw(value) else 1, lbl)
     if k in ("gain", "phantom"):
         n = await mixer.headamp_for(s)
         if n is None:
-            raise ParamError(f"{lbl} is not fed by a local mic preamp (gain/phantom exist only for inputs In01-In16)")
-        addr, kind = f"/headamp/{n:02d}/{k}", KINDS[f"headamp/{k}"]
-        lbl = f"{lbl} preamp {n}"
+            raise ParamError(f"{lbl} is not fed by a local mic preamp (gain/phantom exist only for channels on mic inputs)")
+        addr, kind = p.headamp_addr(n, k), p.kinds[f"headamp/{k}"]
+        lbl = f"{lbl} {p.headamp_label(n)}"
     else:
-        addr, kind = model.friendly_address(s, k, dest)
+        addr, kind = p.friendly_address(s, k, dest)
     if dest is not None:
         lbl = f"{lbl} -> {model.label(dest, names)}"
     if delta is not None:
@@ -171,13 +181,13 @@ def _ratio(value: float | str) -> str:
 async def mixer_status() -> str:
     """Connection info: model, name, IP, firmware, guardrail limits and change count."""
     c = await mixer.ensure()
-    i = mixer.info
-    snap = await c.get("/-snap/index")
+    i, p = mixer.info, mixer.profile
+    snap = await c.get(p.snap_index_addr)
     lim = mixer.limits
     undoable = len(mixer.journal.undoable())
     return "\n".join([
-        f"Connected to {i.model} '{i.name}' at {i.ip}, firmware {i.firmware}." if i else "Connected.",
-        f"Current snapshot index: {snap[0] if snap else '?'}",
+        (f"Connected to {i.model} '{i.name}' at {i.ip}, firmware {i.firmware}." if i else "Connected.") + _experimental(p),
+        f"{p.snap_index_label}: {snap[0] if snap else '?'}",
         (
             f"Guardrails: confirm needed for level jumps > +{lim.max_raise_db:g} dB ending above {lim.loud_db:g} dB, "
             f"main LR above {lim.lr_max_db:+g} dB, preamp gain jumps > +{lim.max_gain_jump_db:g} dB, phantom power, "
@@ -187,34 +197,40 @@ async def mixer_status() -> str:
     ])
 
 
-def _src_label(s: Strip, cfg_text: dict[str, str], rtnsw: Any) -> str:
-    if rtnsw:
-        return cfg_text.get("rtnsrc", "USB") + " (USB)"
-    return "Aux in" if s.kind == "aux" else cfg_text.get("insrc", "?")
+def _experimental(p: Profile) -> str:
+    return f" {p.family} support is EXPERIMENTAL (not yet verified on hardware) - double-check results." if p.experimental else ""
 
 
 @tool(RO)
 async def board_overview() -> str:
     """Whole-board summary: every input with source, preamp gain/phantom, HPF, fader, mute, LR assign and
     active sends; buses, FX sends and returns, main LR and DCAs. Start here."""
-    await mixer.ensure()
+    p = await _profile()
     names = await mixer.names(max_age=0)
-    inputs = [s for s in ALL_STRIPS if s.kind in ("ch", "aux", "fxrtn")]
-    outs = [s for s in ALL_STRIPS if s.kind in ("bus", "fxsend", "lr", "dca")]
+    inputs = p.strips(*p.input_kinds)
+    outs = p.strips(*p.output_kinds)
+    bus_dests = [d for d in p.send_dests if d.kind == "bus"]
+    send_on = "on" in p.send_subs
     addrs: list[str] = []
     for s in inputs:
-        addrs += [s.addr(x) for x in ("mix/on", "mix/fader", "mix/lr", "mix/pan", "eq/on", "preamp/rtnsw")]
-        addrs += [s.addr(f"mix/{i:02d}/level") for i in range(1, 11)] + [s.addr(f"mix/{i:02d}/tap") for i in range(1, 7)]
+        addrs += [s.addr(x) for x in ("mix/on", "mix/fader", p.lr_param, "mix/pan", "eq/on")]
+        addrs += [s.addr(p.send_leaf(d, "level")) for d in p.send_dests]
+        addrs += [s.addr(p.send_leaf(d, "tap")) for d in bus_dests]
+        addrs += [s.addr(p.send_leaf(d, "on")) for d in p.send_dests] if send_on else []
         if s.kind == "ch":
-            addrs += [s.addr(x) for x in ("config/insrc", "preamp/hpon", "preamp/hpf", "preamp/invert", "gate/on", "dyn/on")]
+            addrs += [s.addr(x) for x in ("preamp/hpon", "preamp/hpf", "preamp/invert", "gate/on", "dyn/on")]
     for s in outs:
         addrs += [s.addr(x) for x in (("on", "fader") if s.kind == "dca" else ("mix/on", "mix/fader"))]
         if s.kind == "bus":
-            addrs += [s.addr("mix/lr")]
-    addrs += [f"/headamp/{n:02d}/{p}" for n in range(1, 17) for p in ("gain", "phantom")]
-    addrs += [f"/fx/{n}/type" for n in range(1, 5)] + [f"/config/mute/{n}" for n in range(1, 5)]
+            addrs += [s.addr(p.lr_param)]
+    addrs += [f"/config/mute/{n}" for n in range(1, p.mute_groups + 1)]
     raw = await mixer.get_raw(addrs, strict=False)
-    text = await mixer.read_nodes([s.addr("config")[1:] for s in inputs] + [f"fx/{n}" for n in range(1, 5)])
+    raw.update(await mixer.sources(inputs))
+    heads = {s: p.headamp_of(s, raw) for s in inputs if not p.uses_usb(s, raw)}
+    heads = {s: n for s, n in heads.items() if n is not None}
+    raw.update(await mixer.get_raw([p.headamp_addr(n, x) for n in set(heads.values()) for x in ("gain", "phantom")], strict=False))
+    fx_nodes = [f"fx/{n}" for n in range(1, p.fx_count + 1)]
+    text = await mixer.read_nodes([s.addr("config")[1:] for s in inputs] + fx_nodes)
 
     def v(a: str) -> Any:
         return raw.get(a)
@@ -224,37 +240,36 @@ async def board_overview() -> str:
         return "?" if r is None else units.fmt_db(model.FADER.from_raw(r))
 
     i = mixer.info
-    out = [f"{i.model} '{i.name}' at {i.ip} (fw {i.firmware})" if i else "XR18", ""]
+    out = [(f"{i.model} '{i.name}' at {i.ip} (fw {i.firmware})" if i else p.family) + _experimental(p), ""]
     out.append("INPUTS  id: name | source | preamp | HPF | fader | state | sends")
     for s in inputs:
-        cfg = text.get(s.addr("config")[1:], {})
-        src = _src_label(s, cfg, v(s.addr("preamp/rtnsw"))) if s.kind != "fxrtn" else "FX"
+        src = p.source_label(s, text.get(s.addr("config")[1:], {}), raw)
         pre = ""
         if s.kind == "ch":
-            m = cfg.get("insrc", "")
-            if not v(s.addr("preamp/rtnsw")) and m.startswith("In"):
-                n = int(m[2:])
-                g, p = v(f"/headamp/{n:02d}/gain"), v(f"/headamp/{n:02d}/phantom")
-                pre = f"gain {KINDS['headamp/gain'].from_raw(g):+.1f}{' 48V' if p else ''}" if g is not None else ""
+            n = heads.get(s)
+            g = v(p.headamp_addr(n, "gain")) if n is not None else None
+            if g is not None:
+                pre = f"gain {p.kinds['headamp/gain'].from_raw(g):+.1f}{' 48V' if v(p.headamp_addr(n, 'phantom')) else ''}"
             if v(s.addr("preamp/invert")):
                 pre += " inv"
         hpf = ""
         if s.kind == "ch":
-            hpf = f"HPF {model.KINDS['preamp/hpf'].from_raw(v(s.addr('preamp/hpf'))):.0f}Hz" if v(s.addr("preamp/hpon")) else "HPF off"
+            hpf = f"HPF {p.kinds['preamp/hpf'].from_raw(v(s.addr('preamp/hpf'))):.0f}Hz" if v(s.addr("preamp/hpon")) else "HPF off"
         state = "on" if v(s.addr("mix/on")) else "MUTED"
-        state += "" if v(s.addr("mix/lr")) else " notLR"
+        state += "" if v(s.addr(p.lr_param)) else " notLR"
         procs = [n for n, a in (("gate", "gate/on"), ("comp", "dyn/on")) if s.kind == "ch" and v(s.addr(a))]
         if procs:
             state += " +" + "+".join(procs)
         sends = []
-        for d in model.SEND_DESTS:
-            a = s.addr(model.send_suffix(d) + "/level")
+        for d in p.send_dests:
+            a = s.addr(p.send_leaf(d, "level"))
             if v(a):
                 tap = ""
                 if d.kind == "bus":
-                    t = v(s.addr(model.send_suffix(d) + "/tap"))
+                    t = v(s.addr(p.send_leaf(d, "tap")))
                     tap = f" {model.TAPS[t]}" if isinstance(t, int) and t < len(model.TAPS) else ""
-                sends.append(f"{d.id} {db(a)}{tap}")
+                off = " off" if send_on and v(s.addr(p.send_leaf(d, "on"))) == 0 else ""
+                sends.append(f"{d.id} {db(a)}{tap}{off}")
         name = names.get(s) or "-"
         out.append(
             f"  {s.id}: {name} | {src} | {pre or '-'} | {hpf or '-'} | {db(s.addr('mix/fader'))} | {state} | "
@@ -266,12 +281,14 @@ async def board_overview() -> str:
         on_a, f_a = (s.addr("on"), s.addr("fader")) if s.kind == "dca" else (s.addr("mix/on"), s.addr("mix/fader"))
         extra = ""
         if s.kind == "bus":
-            extra = " | to LR" if v(s.addr("mix/lr")) else ""
+            extra = " | to LR" if v(s.addr(p.lr_param)) else ""
         if s.kind == "fxsend":
             fx = text.get(f"fx/{s.index}", {})
             extra = f" | FX{s.index}: {fx.get('type', '?')}"
         out.append(f"  {s.id}: {names.get(s) or '-'} | {db(f_a)} | {'on' if v(on_a) else 'MUTED'}{extra}")
-    groups = [str(n) for n in range(1, 5) if v(f"/config/mute/{n}")]
+    if "fxsend" not in p.strip_kinds:
+        out.append("FX slots: " + ", ".join(f"{n[3:]}: {text.get(n, {}).get('type', '?')}" for n in fx_nodes))
+    groups = [str(n) for n in range(1, p.mute_groups + 1) if v(f"/config/mute/{n}")]
     out.append("")
     out.append(f"Mute groups engaged: {', '.join(groups) if groups else 'none'}")
     return "\n".join(out)
@@ -283,10 +300,11 @@ async def channel_detail(target: str) -> str:
     config, preamp, gate, compressor, EQ bands, fader, sends, groups."""
     s = await mixer.resolve(target)
     names = await mixer.names()
+    prof = mixer.profile
     paths = [p for p, _ in s.nodes()]
     headamp = await mixer.headamp_for(s)
-    if headamp:
-        paths.append(model.headamp_path(headamp))
+    if headamp is not None:
+        paths.append(prof.headamp_path(headamp))
     text = await mixer.read_nodes(paths)
     out = [f"{model.label(s, names)} - {s.title}"]
     for p in paths:
@@ -296,9 +314,7 @@ async def channel_detail(target: str) -> str:
         b = s.base[1:]
         rel = p[len(b) + 1 :] if p.startswith(b + "/") else ("" if p == b else p)
         if rel.startswith("mix/") and rel[4:].isdigit():
-            n = int(rel[4:])
-            dest = Strip("bus", n) if n <= 6 else Strip("fxsend", n - 6)
-            rel = f"send -> {model.label(dest, names)}"
+            rel = f"send -> {model.label(prof.send_dest(s, int(rel[4:])), names)}"
         if "color" in vals and vals["color"].isdigit():
             ci = int(vals["color"])
             vals = {**vals, "color": COLORS[ci] if ci < len(COLORS) else vals["color"]}
@@ -347,10 +363,12 @@ async def set_send(
     tap: Literal["IN", "PREEQ", "POSTEQ", "PRE", "POST", "GRP"] | None = None,
     confirm: bool = False,
 ) -> str:
-    """Set the send level from a channel/aux/FX return to a bus (bus1-6, monitor mixes) or FX send
-    (fxsend1-4). Give db or delta_db, and optionally the tap point (PRE = pre-fader, usual for monitors)."""
-    src = await mixer.resolve(source, model.SEND_SOURCES)
-    dst = await mixer.resolve(dest, ("bus", "fxsend"), fx_means="fxsend")
+    """Set the send level from a channel/aux/FX return to a bus (monitor mixes: bus1-6 on XR18, bus1-16 on X32)
+    or FX send (fxsend1-4, XR18 only). Give db or delta_db, and optionally the tap point (PRE = pre-fader, usual
+    for monitors; on X32 the tap is shared by a bus pair)."""
+    p = await _profile()
+    src = await mixer.resolve(source, p.send_sources)
+    dst = await mixer.resolve(dest, p.send_dest_kinds, fx_means="fxsend")
     changes = []
     if db is not None or delta_db is not None:
         lvl, delta = _level_args(db, delta_db)
@@ -446,10 +464,10 @@ async def set_compressor(
     detector: Literal["PEAK", "RMS"] | None = None,
     confirm: bool = False,
 ) -> str:
-    """Compressor on a channel, bus or main LR. threshold -60..0 dB, ratio 1.1..100 (snaps to
+    """Compressor on a channel, bus or main LR (X32 also matrix and mono). threshold -60..0 dB, ratio 1.1..100 (snaps to
     1.1/1.3/1.5/2/2.5/3/4/5/7/10/20/100), knee 0..5, makeup 0..24 dB, attack 0..120 ms,
     release 5..4000 ms, mix 0..100 %."""
-    s = await mixer.resolve(target, ("ch", "bus", "lr"))
+    s = await mixer.resolve(target, (await _profile()).comp_kinds)
     params: dict[str, Any] = {
         "on": on, "thr": threshold_db, "ratio": _ratio(ratio) if ratio is not None else None, "knee": knee,
         "gain": makeup_db, "attack": attack_ms, "hold": hold_ms, "release": release_ms, "mix": mix_pct,
@@ -489,13 +507,13 @@ async def set_preamp(
 class ChangeSpec(BaseModel):
     target: str = Field(description="strip name or id, e.g. 'Guitar', 'ch3', 'bus2', 'lr'")
     param: str = Field(
-        description="name, color, fader, mute, on, lr, pan, hpf, hpf.on, invert, usb, gain, phantom, eq.on, "
+        description="name, color, fader, mute, on, lr, pan, hpf, hpf.on, invert, usb (XR18), trim (X32), gain, phantom, eq.on, "
         "eq.<band>.type|freq|gain|q, gate.on|mode|thr|range|attack|hold|release, "
-        "comp.on|thr|ratio|knee|gain|attack|hold|release|mix|auto, send.level|tap|pan (needs dest)"
+        "comp.on|thr|ratio|knee|gain|attack|hold|release|mix|auto, send.level|tap|pan|on (needs dest; on: X32)"
     )
     value: str | float | bool | None = Field(None, description="absolute value (dB, Hz, on/off, label, text)")
     delta: float | None = Field(None, description="relative change instead of value (numeric params)")
-    dest: str | None = Field(None, description="send destination bus1-6 / fxsend1-4 (for send.* params)")
+    dest: str | None = Field(None, description="send destination bus / fxsend (for send.* params)")
 
 
 @tool(RW)
@@ -503,9 +521,10 @@ async def apply_changes(changes: list[ChangeSpec], summary: str = "", confirm: b
     """Apply several changes at once as ONE undo step, e.g. rebalancing a monitor mix:
     [{target:'click', param:'send.level', dest:'bus2', delta:3}, {target:'bass', param:'send.level', dest:'bus2', delta:-2}]."""
     built = []
+    p = await _profile()
     for c in changes:
         s = await mixer.resolve(c.target)
-        dst = await mixer.resolve(c.dest, ("bus", "fxsend"), fx_means="fxsend") if c.dest else None
+        dst = await mixer.resolve(c.dest, p.send_dest_kinds, fx_means="fxsend") if c.dest else None
         if c.param.lower().startswith("comp.ratio") and c.value is not None:
             c.value = _ratio(c.value)  # type: ignore[arg-type]
         built.append(await _change(s, c.param, c.value, c.delta, dst))
@@ -522,7 +541,7 @@ class ChannelSetup(BaseModel):
     hpf_hz: float | Literal["off"] | None = Field(None, description="high-pass frequency 20..400 Hz, or 'off'")
     gain_db: float | None = Field(None, description="mic preamp gain -12..+60 dB")
     phantom: bool | None = Field(None, description="48 V phantom power (needs confirm)")
-    usb: bool | None = Field(None, description="take the signal from the USB return instead of the local input")
+    usb: bool | None = Field(None, description="XR18: take the signal from the USB return instead of the local input")
     lr: bool | None = Field(None, description="assign to main LR")
     fader_db: float | None = None
     pan: float | None = Field(None, description="-100 (left) .. 100 (right)")
@@ -579,7 +598,7 @@ async def setup_monitor_mix(
     if color is not None:
         built.append(await _change(b, "color", color))
     for src_name, level in sends.items():
-        src = await mixer.resolve(src_name, model.SEND_SOURCES)
+        src = await mixer.resolve(src_name, mixer.profile.send_sources)
         built.append(await _change(src, "send.level", level, dest=b))
         built.append(await _change(src, "send.tap", tap, dest=b))
     if bus_fader_db is not None:
@@ -599,12 +618,15 @@ async def read_meters(
     low and silent signals."""
     seconds = units.clamp(seconds, MIN_METER_SECONDS, 30)
     c = await mixer.ensure()
-    bank, layout = mtr.BANKS[scope]
-    frames = await c.sample_meters(bank, seconds)
+    p = mixer.profile
+    if scope not in p.meter_banks:
+        raise ParamError(f"scope {scope!r} is not available on the {p.family} yet; use 'channels'")
+    bank, layout = p.meter_banks[scope]
+    frames = await c.sample_meters(bank, seconds, *p.meter_extra)
     if not frames:
         raise MixerUnavailable("no meter data received")
     names = await mixer.names()
-    levels = mtr.analyse(frames, layout)
+    levels = mtr.analyse(frames, layout, p.decode_meters)
     lines = [f"Levels over {seconds:g}s ({len(frames)} frames), dBFS:"]
     quiet = []
     for lv in levels:
@@ -625,15 +647,18 @@ async def gain_check(targets: list[str] | None = None, seconds: float = 8.0, tar
     only - apply with set_preamp."""
     seconds = units.clamp(seconds, MIN_GAIN_CHECK_SECONDS, 30)
     c = await mixer.ensure()
+    p = mixer.profile
     names = await mixer.names()
-    chans = [await mixer.resolve(t, ("ch",)) for t in targets] if targets else [s for s in ALL_STRIPS if s.kind == "ch"]
-    frames = await c.sample_meters("/meters/1", seconds)
+    chans = [await mixer.resolve(t, ("ch",)) for t in targets] if targets else p.strips("ch")
+    bank, layout = p.meter_banks["channels"]
+    frames = await c.sample_meters(bank, seconds, *p.meter_extra)
     if not frames:
         raise MixerUnavailable("no meter data received")
-    levels = {lv.strip: lv for lv in mtr.analyse(frames, mtr.BANKS["channels"][1]) if lv.strip}
-    raw = await mixer.get_raw([s.addr(x) for s in chans for x in ("config/insrc", "preamp/rtnsw")] +
-                              [f"/headamp/{n:02d}/gain" for n in range(1, 17)], strict=False)
-    gain_kind = KINDS["headamp/gain"]
+    levels = {lv.strip: lv for lv in mtr.analyse(frames, layout, p.decode_meters) if lv.strip}
+    raw = await mixer.sources(chans)
+    heads = {s: p.headamp_of(s, raw) for s in chans}
+    raw.update(await mixer.get_raw([p.headamp_addr(n, "gain") for n in set(heads.values()) if n is not None], strict=False))
+    gain_kind = p.kinds["headamp/gain"]
     lines = [f"Gain check over {seconds:g}s, target peak {target_peak_db:+.0f} dBFS:"]
     for s in chans:
         lv = levels.get(s)
@@ -642,17 +667,17 @@ async def gain_check(targets: list[str] | None = None, seconds: float = 8.0, tar
             continue
         if not targets and lv.peak < mtr.NO_SIGNAL_DB and not names.get(s):
             continue
-        src = raw.get(s.addr("config/insrc"))
-        if raw.get(s.addr("preamp/rtnsw")):
+        if p.uses_usb(s, raw):
             if lv.peak < mtr.NO_SIGNAL_DB:
                 lines.append(f"  {lbl}: no signal from the USB return - is the computer playing into it?")
             else:
                 lines.append(f"  {lbl}: peak {lv.peak:+.1f} - source is USB return; adjust the level on the computer")
             continue
-        if not (isinstance(src, int) and 0 <= src < 16):
+        n = heads[s]
+        if n is None:
             lines.append(f"  {lbl}: peak {lv.peak:+.1f} - not a mic preamp input, no gain suggestion")
             continue
-        g = gain_kind.from_raw(raw.get(f"/headamp/{src + 1:02d}/gain") or 0.0)
+        g = gain_kind.from_raw(raw.get(p.headamp_addr(n, "gain")) or 0.0)
         if lv.peak < mtr.NO_SIGNAL_DB:
             lines.append(f"  {lbl}: NO SIGNAL (gain {g:+.1f}) - check cable, mic, phantom power, or that it is being played")
             continue
@@ -692,12 +717,16 @@ async def list_presets() -> str:
 async def diff_preset(name: str, other: str | None = None, max_lines: int = 80) -> str:
     """Show what differs between a saved preset and the current board (or another preset given as other).
     Answers 'what changed since ...'."""
+    p = await _profile()
     a = presets.read(PRESETS_DIR, name)
+    a.check_profile(p)
     if other:
-        b_values, b_name = presets.read(PRESETS_DIR, other).values, other
+        b = presets.read(PRESETS_DIR, other)
+        b.check_profile(p)
+        b_values, b_name = b.values, other
     else:
-        b_values, b_name = await mixer.get_raw(presets.ALL_LEAVES, strict=False), "current board"
-    lines = presets.diff_lines(a.values, b_values, await mixer.names())
+        b_values, b_name = await mixer.get_raw(p.leaves, strict=False), "current board"
+    lines = presets.diff_lines(a.values, b_values, await mixer.names(), p)
     if not lines:
         return f"No differences between '{a.name}' and {b_name}."
     head = f"{len(lines)} differences, '{a.name}' -> {b_name}:"
@@ -709,14 +738,16 @@ async def diff_preset(name: str, other: str | None = None, max_lines: int = 80) 
 async def load_preset(name: str, confirm: bool = False) -> str:
     """Restore a saved preset to the mixer (only differing parameters are written). Always needs confirm;
     the current board is auto-saved first and the load is one undo step."""
+    prof = await _profile()
     p = presets.read(PRESETS_DIR, name)
-    current = await mixer.get_raw(presets.ALL_LEAVES, strict=False)
-    diffs = presets.differences(current, p.values)
+    p.check_profile(prof)
+    current = await mixer.get_raw(prof.leaves, strict=False)
+    diffs = presets.differences(current, p.values, prof)
     if not diffs:
         return f"The board already matches preset '{p.name}'."
     names = await mixer.names()
     if not confirm:
-        lines = presets.diff_lines(current, p.values, names)
+        lines = presets.diff_lines(current, p.values, names, prof)
         phantom = [ln for ln in lines if "/phantom" in ln or "phantom" in ln]
         reasons = [f"loads preset '{p.name}' (saved {p.saved_at}): {len(diffs)} parameters change"]
         if phantom:
@@ -725,57 +756,80 @@ async def load_preset(name: str, confirm: bool = False) -> str:
     backup = f"autosave-before-{presets.slug(p.name)}-{time.strftime('%Y%m%d-%H%M%S')}"
     await _save_preset(backup, f"Automatic backup before loading '{p.name}'")
     presets.prune(PRESETS_DIR, "autosave-before-", keep=20)
-    changes = [Change(a, p.values[a], presets.param_label(a, names)) for a in diffs]
+    changes = [Change(a, p.values[a], presets.param_label(a, names, prof)) for a in diffs]
     g = await mixer.apply(changes, "load_preset", f"load preset {p.name}", confirm=True)
     return f"Loaded preset '{p.name}': {len(g.changes) if g else 0} parameters changed. Previous board saved as '{backup}'."
 
 
+def _slot(p: Profile, slot: int) -> None:
+    if slot not in p.snap_slots:
+        raise ParamError(f"slot must be {p.snap_slots[0]}-{p.snap_slots[-1]}")
+
+
+def _slot_used(p: Profile, slot: int, raw: dict[str, Any]) -> bool:
+    used = p.snap_used_addr(slot)
+    return bool(raw.get(p.snap_name_addr(slot))) or bool(used and raw.get(used))
+
+
+async def _read_slot(p: Profile, slot: int) -> tuple[str, bool]:
+    """(name, holds data) of a snapshot slot."""
+    addrs = [a for a in (p.snap_name_addr(slot), p.snap_used_addr(slot)) if a]
+    raw = await mixer.get_raw(addrs, strict=False)
+    return raw.get(p.snap_name_addr(slot)) or "", _slot_used(p, slot, raw)
+
+
 @tool(RO)
 async def snapshot_list() -> str:
-    """List the mixer's internal snapshots (slots 1-64) that have a name."""
-    raw = await mixer.get_raw([f"/-snap/{i:02d}/name" for i in range(1, 65)] + ["/-snap/index"], strict=False)
-    used = [f"{i}: {raw[f'/-snap/{i:02d}/name']}" for i in range(1, 65) if raw.get(f"/-snap/{i:02d}/name")]
-    return f"Current snapshot index: {raw.get('/-snap/index')}\n" + ("\n".join(used) if used else "All 64 snapshot slots are empty/unnamed.")
+    """List the mixer's internal snapshots (XR18 slots 1-64, X32 scenes 0-99) that have a name."""
+    p = await _profile()
+    slots = p.snap_slots
+    used_addrs = [a for a in (p.snap_used_addr(i) for i in slots) if a]
+    raw = await mixer.get_raw([p.snap_name_addr(i) for i in slots] + used_addrs + [p.snap_index_addr], strict=False)
+    used = [f"{i}: {raw.get(p.snap_name_addr(i)) or '(no name)'}" for i in slots if _slot_used(p, i, raw)]
+    head = f"{p.snap_index_label}: {raw.get(p.snap_index_addr)}\n"
+    return head + ("\n".join(used) if used else f"All {len(slots)} snapshot slots are empty/unnamed.")
 
 
 @tool(DESTRUCTIVE)
 async def snapshot_save(slot: int, name: str, confirm: bool = False) -> str:
-    """Save the current board into the mixer's internal snapshot slot 1-64 with a name (max 12 chars).
-    Overwriting a named slot needs confirm."""
-    if not 1 <= slot <= 64:
-        raise ParamError("slot must be 1-64")
-    model.KINDS["config/name"].to_raw(name)
+    """Save the current board into one of the mixer's internal snapshot slots (XR18 1-64, X32 scenes 0-99)
+    with a name (max 12 chars). Overwriting a named slot needs confirm."""
+    p = await _profile()
+    _slot(p, slot)
+    p.kinds["config/name"].to_raw(name)
     c = await mixer.ensure()
-    addr = f"/-snap/{slot:02d}/name"
-    old = (await mixer.get_raw([addr]))[addr]
-    if old and not confirm:
-        raise NeedsConfirmation([f"slot {slot} already holds snapshot '{old}' - it will be overwritten"])
-    c.send("/-snap/name", name)
-    c.send("/-snap/save", slot)
+    addr = p.snap_name_addr(slot)
+    old, used = await _read_slot(p, slot)
+    if used and not confirm:
+        raise NeedsConfirmation([f"slot {slot} already holds snapshot '{old or '(no name)'}' - it will be overwritten"])
+    p.snap_save(c, slot, name)
     new = (await mixer.get_raw([addr]))[addr]
-    return f"Saved snapshot {slot} '{new}'." if new else f"Sent save to slot {slot}, but the slot name reads empty - check in X AIR Edit."
+    return f"Saved snapshot {slot} '{new}'." if new else f"Sent save to slot {slot}, but the slot name reads empty - check on the mixer."
 
 
 @tool(DESTRUCTIVE)
 async def snapshot_load(slot: int, confirm: bool = False) -> str:
     """Load one of the mixer's internal snapshots (changes the whole board). Always needs confirm; the current
     board is auto-saved as a preset first so it can be restored with load_preset."""
-    if not 1 <= slot <= 64:
-        raise ParamError("slot must be 1-64")
+    p = await _profile()
+    _slot(p, slot)
     c = await mixer.ensure()
-    addr = f"/-snap/{slot:02d}/name"
-    nm = (await mixer.get_raw([addr]))[addr]
-    if not nm:
+    nm, used = await _read_slot(p, slot)
+    if not used:
         raise ParamError(f"snapshot slot {slot} is empty")
+    nm = nm or "(no name)"
     if not confirm:
         raise NeedsConfirmation([f"loads mixer snapshot {slot} '{nm}' - the whole board changes"])
     backup = f"autosave-before-snapshot-{slot}-{time.strftime('%Y%m%d-%H%M%S')}"
     await _save_preset(backup, f"Automatic backup before loading snapshot {slot} '{nm}'")
-    c.send("/-snap/load", slot)
-    index = (await mixer.get_raw(["/-snap/index"]))["/-snap/index"]
+    p.snap_load(c, slot)
+    if not p.snap_index_verifies:
+        return (f"Sent the load for snapshot {slot} '{nm}'. This mixer doesn't report which snapshot is loaded, so check"
+                f" the console.{p.snap_load_note} Previous board saved as preset '{backup}'.")
+    index = (await mixer.get_raw([p.snap_index_addr]))[p.snap_index_addr]
     if index != slot:
         return (f"Sent the load for snapshot {slot} '{nm}', but the mixer reports snapshot {index} as current - "
-                f"check in X AIR Edit. Previous board saved as preset '{backup}'.")
+                f"check on the mixer. Previous board saved as preset '{backup}'.")
     return f"Loaded snapshot {slot} '{nm}'. Previous board saved as preset '{backup}'."
 
 
@@ -788,7 +842,7 @@ async def undo(steps: int = 1) -> str:
     out = []
     for g in groups:
         out.append(f"Reverted change #{g.id} ({g.summary}):")
-        out += [f"  {c.label}: back to {describe_raw(c.address, c.old)}" for c in g.changes]
+        out += [f"  {c.label}: back to {describe_raw(c.address, c.old, c.profile)}" for c in g.changes]
     if failed:
         out.append(f"These did not reach the mixer (network packets lost), check them: {', '.join(failed)}")
     return "\n".join(out)
@@ -815,7 +869,7 @@ async def change_history(limit: int = 10) -> str:
 def _check_blocked(address: str) -> None:
     if not address.startswith("/"):
         raise ParamError("OSC addresses start with '/', e.g. /ch/01/mix/fader")
-    if any(address.startswith(p) for p in model.BLOCKED_PREFIXES):
+    if any(address.startswith(p) for p in mixer.profile.blocked_prefixes):
         raise ParamError(f"{address} is blocked: it holds network settings and Wi-Fi passwords")
 
 
@@ -828,7 +882,7 @@ async def osc_get(address: str) -> str:
     r = await c.get(address)
     t = await c.node(address[1:])
     if r is None and t is None:
-        raise ParamError(f"The mixer does not answer for {address}; it is probably not a valid XR18 address.")
+        raise ParamError(f"The mixer does not answer for {address}; it is probably not a valid {mixer.profile.family} address.")
     return f"{address} raw={r[0] if r else '?'!r} text={t.strip() if t else '?'}"
 
 
@@ -838,7 +892,7 @@ async def osc_set(address: str, value: str | float | int, confirm: bool = False)
     names). Prefer the dedicated tools. Guardrails still apply; system paths need confirm."""
     _check_blocked(address)
     names = await mixer.names()
-    lbl = presets.param_label(address, names)
+    lbl = presets.param_label(address, names, mixer.profile)
     return done(await mixer.apply([Change(address, value, lbl)], "osc_set", f"osc {address}", confirm))
 
 

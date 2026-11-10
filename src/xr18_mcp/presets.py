@@ -13,8 +13,6 @@ from typing import Any
 from . import model
 from .safety import describe_raw
 
-ALL_LEAVES: list[str] = list(model.LEAF_KINDS)
-
 
 def slug(name: str) -> str:
     s = re.sub(r"[^\w\-]+", "-", name.strip(), flags=re.UNICODE).strip("-")
@@ -30,19 +28,31 @@ class Preset:
     saved_at: str
     notes: str
     values: dict[str, Any]
+    profile: str = "xair"
+
+    def check_profile(self, profile: model.Profile) -> None:
+        if self.profile != profile.name:
+            raise model.ParamError(
+                f"Preset {self.name!r} was saved from a different mixer type ({self.profile}); "
+                f"it can't be used with this {profile.family}."
+            )
 
 
 def clean(raw: dict[str, Any]) -> dict[str, Any]:
     return {a: (None if isinstance(v, float) and math.isnan(v) else v) for a, v in raw.items()}
 
 
-def write(dir_: Path, name: str, notes: str, values: dict[str, Any], mixer_info: dict[str, str] | None) -> Path:
+def write(
+    dir_: Path, name: str, notes: str, values: dict[str, Any], mixer_info: dict[str, Any] | None,
+    profile: model.Profile = model.XAIR,
+) -> Path:
     dir_.mkdir(parents=True, exist_ok=True)
     path = dir_ / f"{slug(name)}.json"
     doc = {
         "name": name,
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "notes": notes,
+        "profile": profile.name,
         "mixer": mixer_info or {},
         "values": clean(values),
     }
@@ -56,7 +66,10 @@ def read(dir_: Path, name: str) -> Preset:
         known = ", ".join(p.stem for p in sorted(dir_.glob("*.json"))) or "none"
         raise model.ParamError(f"No preset {name!r}. Saved presets: {known}")
     doc = json.loads(path.read_text(encoding="utf-8"))
-    return Preset(doc.get("name", path.stem), path, doc.get("saved_at", ""), doc.get("notes", ""), doc["values"])
+    return Preset(
+        doc.get("name", path.stem), path, doc.get("saved_at", ""), doc.get("notes", ""), doc["values"],
+        doc.get("profile", "xair"),  # presets from before multi-mixer support are all XR18
+    )
 
 
 def listing(dir_: Path) -> list[dict[str, str]]:
@@ -86,25 +99,27 @@ def same(a: Any, b: Any) -> bool:
     return a == b
 
 
-def differences(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+def differences(before: dict[str, Any], after: dict[str, Any], profile: model.Profile = model.XAIR) -> list[str]:
     """Addresses whose value differs (skips values missing on either side)."""
-    return [a for a in ALL_LEAVES if _known(before.get(a)) and _known(after.get(a)) and not same(before[a], after[a])]
+    return [a for a in profile.leaves if _known(before.get(a)) and _known(after.get(a)) and not same(before[a], after[a])]
 
 
 def _known(v: Any) -> bool:
     return v is not None and not (isinstance(v, float) and math.isnan(v))
 
 
-def param_label(address: str, names: dict[model.Strip, str]) -> str:
-    s = model.strip_of(address)
+def param_label(address: str, names: dict[model.Strip, str], profile: model.Profile = model.XAIR) -> str:
+    s = profile.strip_of(address)
     if s is None:
         return address
     rel = address[len(s.base) + 1 :] if address != s.base else ""
     return f"{model.label(s, names)} {rel}".strip()
 
 
-def diff_lines(before: dict[str, Any], after: dict[str, Any], names: dict[model.Strip, str]) -> list[str]:
+def diff_lines(
+    before: dict[str, Any], after: dict[str, Any], names: dict[model.Strip, str], profile: model.Profile = model.XAIR
+) -> list[str]:
     return [
-        f"{param_label(a, names)}: {describe_raw(a, before[a])} -> {describe_raw(a, after[a])}"
-        for a in differences(before, after)
+        f"{param_label(a, names, profile)}: {describe_raw(a, before[a], profile)} -> {describe_raw(a, after[a], profile)}"
+        for a in differences(before, after, profile)
     ]
