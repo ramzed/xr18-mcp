@@ -1,6 +1,6 @@
 [project]
 name = "xr18-mcp"
-version = "0.1.1"
+version = "0.2.0"
 description = "MCP server that lets an AI assistant run a Behringer XR18 mixer (X32/M32 experimental)"
 readme = "README.md"
 license = "MIT"
