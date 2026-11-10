@@ -1,14 +1,14 @@
 [project]
 name = "xr18-mcp"
 version = "0.1.1"
-description = "MCP server that lets an AI assistant run a Behringer XR18 mixer"
+description = "MCP server that lets an AI assistant run a Behringer XR18 mixer (X32/M32 experimental)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
     { name = "Pavel Lazarenko", email = "pavel.lazarenko@gmail.com" }
 ]
-keywords = ["mcp", "behringer", "xr18", "x-air", "mixer", "osc", "live-sound", "ai"]
+keywords = ["mcp", "behringer", "xr18", "x-air", "x32", "m32", "mixer", "osc", "live-sound", "ai"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",
@@ -51,4 +51,4 @@ source = ["xr18_mcp"]
 [tool.coverage.report]
 show_missing = true
 fail_under = 95
-exclude_lines = ["pragma: no cover", "if __name__ == .__main__.:"]
+exclude_lines = ["pragma: no cover", "if __name__ == .__main__.:", "raise NotImplementedError", "if TYPE_CHECKING:"]

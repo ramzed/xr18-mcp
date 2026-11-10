@@ -3,7 +3,7 @@ import struct
 import pytest
 
 from xr18_mcp import meters
-from xr18_mcp.model import Strip
+from xr18_mcp.model import XAIR, Strip
 
 from .fake_mixer import meter_blob
 
@@ -17,10 +17,10 @@ def test_decode():
 
 def test_bank_layouts_match_documented_sizes():
     for scope, count in (("channels", 40), ("inputs", 36)):
-        _, layout = meters.BANKS[scope]
+        _, layout = XAIR.meter_banks[scope]
         idx = sorted(i for _, _, idxs in layout for i in idxs)
         assert idx == list(range(count))
-    _, layout = meters.BANKS["channels"]
+    _, layout = XAIR.meter_banks["channels"]
     by_id = {ident: (strip, idxs) for ident, strip, idxs in layout}
     assert by_id["ch16"] == (Strip("ch", 16), [15])
     assert by_id["fxrtn4"][1] == [24, 25]

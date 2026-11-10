@@ -1,4 +1,4 @@
-"""Asyncio OSC/UDP client for the XR18 with request/response matching.
+"""Asyncio OSC/UDP client for Behringer X-Air / X32 mixers with request/response matching.
 
 Unlike a "send, sleep, read the last message" approach, every reply is matched
 to its request by address (or, for /node, by the path echoed in the text), so
@@ -10,13 +10,14 @@ from __future__ import annotations
 import asyncio
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pythonosc.osc_message import OscMessage
 from pythonosc.osc_message_builder import OscMessageBuilder
 
 XAIR_PORT = 10024
+X32_PORT = 10023
 METER_RENEW_SECONDS = 5.0  # meter subscriptions expire after about 10 s
 
 
@@ -33,6 +34,7 @@ class MixerInfo:
     name: str
     model: str
     firmware: str
+    port: int = field(default=0, compare=False)
 
 
 class _Proto(asyncio.DatagramProtocol):
@@ -146,7 +148,7 @@ class OscClient:
         r = await self.get("/xinfo")
         if not r or len(r) < 4:
             return None
-        return MixerInfo(*[str(x) for x in r[:4]])
+        return MixerInfo(*[str(x) for x in r[:4]], port=self.port)
 
     # --------------------------------------------------------------- meters
 
@@ -190,7 +192,7 @@ def _subnet_broadcast() -> str | None:
 
 
 def discover(timeout: float = 1.5) -> list[MixerInfo]:
-    """Find X-Air mixers on the LAN via /xinfo (blocking).
+    """Find X-Air and X32 mixers on the LAN via /xinfo (blocking).
 
     Tries the limited broadcast, the local /24 broadcast and the mixer's access-point address;
     the limited broadcast alone can fail on macOS or on networks without a default route.
@@ -201,14 +203,15 @@ def discover(timeout: float = 1.5) -> list[MixerInfo]:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         s.settimeout(0.2)
         for target in targets:
-            try:
-                s.sendto(build("/xinfo"), (target, XAIR_PORT))
-            except OSError:
-                continue
+            for port in (XAIR_PORT, X32_PORT):
+                try:
+                    s.sendto(build("/xinfo"), (target, port))
+                except OSError:
+                    continue
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             try:
-                data, (ip, _) = s.recvfrom(4096)
+                data, (ip, port) = s.recvfrom(4096)
             except (TimeoutError, OSError):
                 continue
             try:
@@ -216,5 +219,5 @@ def discover(timeout: float = 1.5) -> list[MixerInfo]:
             except Exception:
                 continue
             if msg.address == "/xinfo" and len(msg.params) >= 4:
-                found[ip] = MixerInfo(ip, *[str(x) for x in list(msg.params)[1:4]])
+                found[ip] = MixerInfo(ip, *[str(x) for x in list(msg.params)[1:4]], port=port)
     return list(found.values())

@@ -6,22 +6,30 @@
 An MCP server that lets Claude work as a sound tech on a **Behringer XR18** during rehearsals.
 It connects over OSC/UDP and can run alongside X AIR Edit, which shows every change live.
 
+> **X32 / M32: experimental.** The server also recognises Behringer X32 and Midas M32 consoles (same OSC family,
+> port 10023) and switches to an X32 address map automatically. Its node layouts are checked against a scene
+> saved by X32-Edit (firmware 4.0), and meters, scenes and discovery are cross-checked against the protocol
+> document and two open-source X32 clients ([docs/x32-sources.md](docs/x32-sources.md)). It has not run on a real
+> console yet; reports from X32 owners are welcome.
+
 ## Install
 
 **To use it** (any Mac or PC on the mixer's network): install [uv](https://docs.astral.sh/uv/), then run
 
 ```
-uv tool install git+https://github.com/ramzed/xr18-mcp
+uv tool install https://github.com/ramzed/xr18-mcp/archive/refs/heads/main.zip
 ```
 
-and register the `xr18-mcp` command in your AI app. [INSTALL.md](INSTALL.md) has step-by-step instructions
-for Claude Desktop, Claude Code and Antigravity. To update later, run `uv tool upgrade xr18-mcp`.
+and register the `xr18-mcp` command in your AI app. No git needed. [INSTALL.md](INSTALL.md) has step-by-step
+instructions for people new to the command line (Mac and Windows; Claude Desktop, Claude Code and Antigravity).
+To update later, run the same command with `--reinstall`.
 
 **To work on it:** clone the repo and open the folder in Claude Code. `.mcp.json` runs the server from the
 checkout with `uv run xr18-mcp` and keeps presets and logs in the repo folder (automatic backups are
 gitignored). Approve the `xr18` server and check it with `/mcp`.
 
-The mixer is found automatically with an `/xinfo` search. Set `XR18_IP` only if that fails.
+The mixer is found automatically with an `/xinfo` search (X-Air port 10024 and X32 port 10023). Set `XR18_IP`
+only if that fails.
 
 ## Things to ask
 
@@ -44,7 +52,14 @@ The mixer is found automatically with an `/xinfo` search. Set `XR18_IP` only if 
 | Raw | `osc_get`, `osc_set` |
 
 Strips can be named by their mixer name ("Guitar", "click") or by id: `ch1-16`, `aux`, `fxrtn1-4`, `bus1-6`,
-`fxsend1-4`, `lr`, `dca1-4`.
+`fxsend1-4`, `lr`, `dca1-4`. On an X32: `ch1-32`, `aux1-8`, `fxrtn1-8`, `bus1-16`, `mtx1-6`, `lr`, `mono`,
+`dca1-8`.
+
+What differs on the X32: there are no FX send strips (FX are fed from buses), the send tap point is shared by a bus
+pair, each send has its own on/off (`send.on`), channels have a digital `trim` instead of a USB switch, preamp gain
+follows the input routing (local inputs and AES50 stage boxes), snapshots are the console's scenes 0-99, and
+`read_meters` supports only the `channels` scope. Presets remember which mixer type saved them and can't be loaded
+on the other type.
 
 ## Safety
 
@@ -76,14 +91,15 @@ uv sync
 uv run pytest --cov    # no hardware needed
 ```
 
-The tests run against `tests/fake_mixer.py`, an in-process UDP stand-in for the XR18. It answers reads, stores writes,
+The tests run against `tests/fake_mixer.py`, an in-process UDP stand-in for the XR18 (or an X32). It answers reads, stores writes,
 renders `/node` text, streams meters, handles snapshot commands and can simulate lost packets. Every MCP tool is tested
 through the MCP layer, and coverage must stay at 95% or more. CI runs the suite on Linux, macOS and Windows with Python
 3.10 and 3.13.
 
-Layout: `osc_client.py` (UDP, matches each reply to its request, pipelined reads, meters) · `model.py` (address
-map, value conversions, name lookup) · `mixer.py` (connection, guarded writes, undo) · `safety.py` · `meters.py` ·
-`presets.py` · `server.py` (MCP tools).
+Layout: `osc_client.py` (UDP, matches each reply to its request, pipelined reads, meters) · `model.py` (value
+conversions, strips, the `Profile` base class with name lookup and parameter mapping) · `xair.py` / `x32.py` (each
+mixer family's address map) · `mixer.py` (connection, profile detection, guarded writes, undo) · `safety.py` ·
+`meters.py` · `presets.py` · `server.py` (MCP tools).
 
 ### XR18 OSC notes (checked on firmware 1.25)
 
